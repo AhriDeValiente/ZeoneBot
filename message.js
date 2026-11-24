@@ -287,6 +287,13 @@ function isMessageProcessed(messageId) {
     return false;
 }
 
+// Tandai ID pesan yang dikirim bot sendiri sebagai "sudah diproses" supaya echo
+// pesan keluar (jika masih masuk lewat messages.upsert, mis. emitOwnEvents aktif
+// atau kirim dari device lain) tidak ter-log dobel / dieksekusi ulang sebagai command.
+function markMessageProcessed(messageId) {
+    if (messageId) processedMessages.set(messageId, Date.now());
+}
+
 const groupSettingsCache = new Map();
 const groupMetadataCache = new Map();
 
@@ -620,6 +627,7 @@ export async function handleIncomingMessages(sock, msg, state) {
                         { text: String(sanitizeText(replyText)) },
                         { quoted: fromMe ? undefined : m, ...options }
                     );
+                    markMessageProcessed(result?.key?.id);
                     logOutgoingMessage(targetJid, { text: String(replyText) }, resolvedName || m.pushName);
                     return result;
                 } catch (err) {
@@ -632,6 +640,7 @@ export async function handleIncomingMessages(sock, msg, state) {
                 if (!sock.user) { logger.warn(`[SENDTEXT SKIP] sock.user null → ${targetJid}`); return null; }
                 try {
                     const result = await sock.sendMessage(targetJid, { text: String(sanitizeText(textContent)) });
+                    markMessageProcessed(result?.key?.id);
                     logOutgoingMessage(targetJid, { text: String(textContent) }, resolvedName || m.pushName);
                     return result;
                 } catch (err) {
@@ -644,6 +653,7 @@ export async function handleIncomingMessages(sock, msg, state) {
                 if (!sock.user) { logger.warn(`[SENDMSG SKIP] sock.user null → ${targetJid}`); return null; }
                 try {
                     const result = await sock.sendMessage(targetJid, content, { quoted: m, ...options });
+                    markMessageProcessed(result?.key?.id);
                     if (content.text) logOutgoingMessage(targetJid, { text: content.text }, resolvedName || m.pushName);
                     else if (content.image) logOutgoingMessage(targetJid, { image: true, caption: content.caption, mimetype: content.mimetype, fileLength: content.fileLength }, resolvedName || m.pushName);
                     else if (content.video) logOutgoingMessage(targetJid, { video: true, caption: content.caption, mimetype: content.mimetype, fileLength: content.fileLength }, resolvedName || m.pushName);

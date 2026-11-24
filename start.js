@@ -334,7 +334,10 @@ export async function start() {
             mobile: false,
             markOnlineOnConnect: true,
             syncFullHistory: false,
-            emitOwnEvents: true
+            // false: pesan keluar bot TIDAK di-emit ulang ke messages.upsert.
+            // Jika true, setiap pesan yang dikirim bot ter-echo balik ke handler
+            // dan ter-log OUTGOING dua kali (log langsung + log echo).
+            emitOwnEvents: false
         });
         botState.sock = sock;
         botState.saveCreds = saveCreds;
