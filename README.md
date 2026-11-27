@@ -1,4 +1,4 @@
-# 🤖 ZeoneBot v3.0.0
+# 🤖 ZeoneBot v3.0.0 - WhatsApp Bot Template
 
 **ZeoneBot** adalah WhatsApp Bot tingkat lanjut (Frontier Engineering) yang dibangun menggunakan **Node.js (ES Modules)** dan **Baileys** (`@whiskeysockets/baileys`). Bot ini dirancang dengan arsitektur *First-Principles*, memprioritaskan stabilitas koneksi, keamanan data, dan performa eksekusi tingkat tinggi.
 
