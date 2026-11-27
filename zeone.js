@@ -88,8 +88,12 @@ export function getMessageType(m) {
 
 export function isSelfChat(remoteJid, fromMe, botNumber, botLid) {
     if (!fromMe) return false;
-    const remoteNumber = remoteJid.split('@')[0];
-    if (remoteNumber === botNumber) return true;
+    // Bandingkan nomor TANPA suffix device di KEDUA sisi: botNumber bisa saja
+    // masih memakai bentuk sock.user.id ("62xxx:10") sementara remoteJid chat
+    // tidak pernah ber-suffix — tanpa strip, self chat bentuk nomor tidak
+    // pernah match dan command self-only gagal "hanya untuk self chat".
+    const remoteNumber = remoteJid.split('@')[0].split(':')[0];
+    if (remoteNumber === (botNumber?.split(':')[0] || '')) return true;
     if (remoteJid.endsWith('@lid') && botLid) {
         const remoteLidNum = remoteJid.split('@')[0].split(':')[0];
         const botLidNum = botLid.split(':')[0];

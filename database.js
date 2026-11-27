@@ -1,6 +1,6 @@
 // database.js - JSON + AES-256-GCM + Write Queue + Schema Versioning
-// (tetap file terpisah; logger sekarang diimpor dari zeone.js hasil merge)
 import fs from 'fs/promises';
+import fsSync from 'fs'; // Tambahan untuk sinkronisasi saat exit
 import path from 'path';
 import crypto from 'crypto';
 import config from './config.js';
@@ -73,25 +73,37 @@ function makeDefaultCache() {
 
 let CACHE = makeDefaultCache();
 let writeQueue = Promise.resolve();
-let pendingWrite = false;
+
+// ─── FIX: Mencegah Data Loss saat penulisan beruntun ───
+let isWriting = false;
+let isDirty = false;
 
 function enqueueWrite(fn) { writeQueue = writeQueue.then(fn, fn); }
+
 async function performWrite() {
+    if (isWriting) {
+        isDirty = true;
+        return;
+    }
+    isWriting = true;
+    isDirty = false;
     try {
         const jsonData = JSON.stringify(CACHE, null, 2);
         const encrypted = encrypt(jsonData);
         await fs.writeFile(TMP_PATH, encrypted, 'utf8');
         await fs.rename(TMP_PATH, DB_PATH);
-        pendingWrite = false;
     } catch (err) {
         logger.error(`❌ Gagal menyimpan database: ${err.message}`);
-        pendingWrite = false;
         try { await fs.unlink(TMP_PATH); } catch {}
+    } finally {
+        isWriting = false;
+        if (isDirty) {
+            enqueueWrite(performWrite);
+        }
     }
 }
+
 function scheduleWrite() {
-    if (pendingWrite) return;
-    pendingWrite = true;
     enqueueWrite(performWrite);
 }
 
@@ -164,7 +176,20 @@ export const db = {
     async getGlobal() { return CACHE.global; },
     getSchemaVersion() { return CACHE._schemaVersion; }
 };
-process.on('beforeExit', async () => { await writeQueue; await performWrite(); });
+
+// ─── FIX: Sinkronisasi penulisan saat proses dimatikan ───
+const syncSaveOnExit = () => {
+    try {
+        const jsonData = JSON.stringify(CACHE, null, 2);
+        const encrypted = encrypt(jsonData);
+        fsSync.writeFileSync(DB_PATH, encrypted, 'utf8');
+    } catch (e) {
+        logger.error(`❌ Gagal menyimpan database saat exit: ${e.message}`);
+    }
+};
+process.on('SIGINT', () => { syncSaveOnExit(); process.exit(0); });
+process.on('SIGTERM', () => { syncSaveOnExit(); process.exit(0); });
+process.on('beforeExit', () => { syncSaveOnExit(); });
 
 // export untuk unit test
 export { encrypt, decrypt };

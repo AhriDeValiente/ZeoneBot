@@ -3,7 +3,7 @@
 // Hasil merge: logger & utils dari zeone.js; reportManager & errorCollector
 // yang tadinya file terpisah (folder reports/) sekarang digabung di message.js.
 
-import { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } from "@whiskeysockets/baileys";
+import { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } from "@whiskeysockets/baileys";
 import {
     loadCommands,
     watchCommands,
@@ -14,7 +14,7 @@ import {
     cleanJid,
     formatFileSize
 } from "./zeone.js";
-import { handleIncomingMessages, installGlobalErrorHandlers, reportSystem } from "./message.js";
+import { handleIncomingMessages, installGlobalErrorHandlers, reportSystem, storeMessage, loadStoredMessage } from "./message.js";
 import pino from "pino";
 import fs from "fs";
 import path from "path";
@@ -52,7 +52,8 @@ process.on('unhandledRejection', async (reason) => {
     logger.error(`[UNHANDLED REJECTION] ${msg}`);
     if (botState.sock && config.ownerNumber) {
         const ownerJid = config.ownerNumber.includes('@') ? config.ownerNumber : `${config.ownerNumber}@s.whatsapp.net`;
-        await botState.sock.sendMessage(ownerJid, { text: `🚨 *UNHANDLED REJECTION*\n\n${String(reason?.stack || reason).substring(0, 2000)}` }).catch(() => {});
+        await botState.sock.sendMessage(ownerJid, { text: `🚨 *UNHANDLED REJECTION*\n\n${String(reason?.stack || reason).substring(0, 2000)}` })
+            .then(r => { if (r) storeMessage(r); }).catch(() => {});
     }
 });
 process.on('uncaughtException', async (err) => {
@@ -61,7 +62,8 @@ process.on('uncaughtException', async (err) => {
     logger.error(`[UNCAUGHT EXCEPTION] ${err.stack || err}`);
     if (botState.sock && config.ownerNumber) {
         const ownerJid = config.ownerNumber.includes('@') ? config.ownerNumber : `${config.ownerNumber}@s.whatsapp.net`;
-        await botState.sock.sendMessage(ownerJid, { text: `💥 *UNCAUGHT EXCEPTION*\n\n${err.stack?.substring(0, 2000)}` }).catch(() => {});
+        await botState.sock.sendMessage(ownerJid, { text: `💥 *UNCAUGHT EXCEPTION*\n\n${err.stack?.substring(0, 2000)}` })
+            .then(r => { if (r) storeMessage(r); }).catch(() => {});
     }
     if (botState.saveCreds) await botState.saveCreds().catch(() => {});
     process.exit(1);
@@ -126,7 +128,6 @@ async function attemptReconnect() {
             botState.saveCreds = newSave;
             botState.sock = z;
             await attachEventHandlers(z, newSave);
-            z.ev.on("creds.update", newSave);
             connectionState.restarting = false;
             updateCircuitBreaker(true);
         } catch (e) {
@@ -180,6 +181,13 @@ function printSystemPanel(userNumber = "-") {
 
 async function pairingFlow(sock) {
     await new Promise(r => setTimeout(r, PAIRING_RETRY_DELAY));
+    
+    // FIX: Cegah crash jika bot berjalan di background (PM2/Docker) tanpa TTY
+    if (!process.stdin.isTTY) {
+        logger.error("❌ Bot belum terautentikasi. Jalankan 'node start.js' secara manual di terminal untuk pairing.");
+        process.exit(1);
+    }
+
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     const askNumber = () => new Promise(resolve => rl.question("📱 Masukkan nomor WhatsApp (format: 628xxx): ", resolve));
     let number = '';
@@ -204,8 +212,21 @@ async function cleanupOldSessions() {
     } catch {}
 }
 
+// ── DEDUP PANGGILAN UNTUK AUTO REJECT CALL ───────────────────────────────────
+// WhatsApp mengirim >1 entry event per panggilan fisik: state 'offer' lalu
+// 'ringing' (call.id sama), dan kadang copy tambahan lewat routing LID vs
+// nomor telepon. Tanpa filter, 1 panggilan = 2-4x reject + 2-4x notif.
+const CALL_DEDUP_TTL = 2 * 60 * 1000;  // umur maksimal satu panggilan aktif
+const CALLER_DEDUP_TTL = 10 * 1000;    // jendela anti-duplikat lintas-identitas
+const handledCalls = new Map();        // callId → timestamp terakhir diproses
+const handledCallers = new Map();      // nomor penelepon (base) → timestamp
+const baseNum = (jid) => (jid?.split('@')[0] || '').split(':')[0];
+
 async function attachEventHandlers(sock, saveCreds) {
     sock.ev.on("messages.upsert", async msg => {
+        // Simpan SEMUA pesan masuk ke store SEBELUM skip/dedup — dibutuhkan
+        // getMessage untuk re-encrypt saat retry (termasuk pesan yang di-skip handler).
+        for (const m of msg.messages || []) storeMessage(m);
         const firstMsg = msg.messages?.[0];
         if (!firstMsg?.message) return;
         const msgType = Object.keys(firstMsg.message)[0];
@@ -289,14 +310,30 @@ async function attachEventHandlers(sock, saveCreds) {
     sock.ev.on('call', async (calls) => {
         if (!sock.user || !botState.isConnected) return;
         const callArray = Array.isArray(calls) ? calls : [calls];
+        const now = Date.now();
+        for (const [key, ts] of handledCalls) if (now - ts > CALL_DEDUP_TTL) handledCalls.delete(key);
+        for (const [key, ts] of handledCallers) if (now - ts > CALLER_DEDUP_TTL) handledCallers.delete(key);
         for (const call of callArray) {
             try {
+                // 1. Hanya entry 'offer' yang diproses — 'ringing'/'timeout' adalah
+                //    update state dari panggilan yang sama (call.id sama).
+                if (call.event && call.event !== "offer") continue;
+                if (!call.id || !call.from) continue;
+                // 2. Dedup per callId (entry duplikat / event dikirim ulang).
+                if (handledCalls.has(call.id)) continue;
+                // 3. Dedup per nomor penelepon untuk copy lintas-identitas
+                //    (nomor vs LID) yang callId-nya berbeda.
+                const callerKey = baseNum(call.from);
+                if (callerKey && handledCallers.has(callerKey)) continue;
+                handledCalls.set(call.id, now);
+                if (callerKey) handledCallers.set(callerKey, now);
                 const global = await getGlobalSettings();
                 if (global.autoRejectCall?.enabled) {
                     const callerJid = call.from;
                     const rejectMsg = global.autoRejectCall?.message || "Maaf, bot tidak menerima panggilan.";
                     await sock.rejectCall(call.id, call.from).catch(() => {});
-                    await sock.sendMessage(callerJid, { text: rejectMsg }).catch(() => {});
+                    await sock.sendMessage(callerJid, { text: rejectMsg })
+                        .then(r => { if (r) storeMessage(r); }).catch(() => {});
                     logger.info(`📞 Panggilan dari ${cleanJid(callerJid)} ditolak otomatis`);
                 }
             } catch {}
@@ -328,12 +365,18 @@ export async function start() {
         const sock = await makeWASocket({
             version,
             logger: baileysLogger,
-            auth: state,
+            // Batch penulisan signal key ke disk (pola resmi Baileys) — mencegah
+            // race prekey → sesi korup → pesan penerima "Menunggu pesan ini".
+            auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, baileysLogger) },
             browser: BROWSER_META,
             printQRInTerminal: false,
             mobile: false,
             markOnlineOnConnect: true,
             syncFullHistory: false,
+            // Suplai isi pesan asli untuk re-encrypt saat retry delivery (device
+            // penerima gagal dekripsi awal). Tanpa ini penerima terjebak
+            // "Menunggu pesan ini. Ini mungkin membutuhkan waktu beberapa saat."
+            getMessage: async key => loadStoredMessage(key.remoteJid, key.id)?.message,
             // false: pesan keluar bot TIDAK di-emit ulang ke messages.upsert.
             // Jika true, setiap pesan yang dikirim bot ter-echo balik ke handler
             // dan ter-log OUTGOING dua kali (log langsung + log echo).
@@ -343,7 +386,6 @@ export async function start() {
         botState.saveCreds = saveCreds;
         await attachEventHandlers(sock, saveCreds);
         if (!sock.authState?.creds?.me) await pairingFlow(sock);
-        sock.ev.on("creds.update", saveCreds);
     } catch (err) {
         logger.error(`❌ Fatal error saat start(): ${err?.message || err}`);
         process.exit(1);

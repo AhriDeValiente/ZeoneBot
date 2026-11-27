@@ -29,9 +29,10 @@ function formatUptime(seconds) {
 }
 
 function formatDateShort(date) {
-    const days = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
-    const months = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
-    return `${days[date.getDay()]}, ${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
+    // Format tanggal angka semua: DD/MM/YYYY
+    const dd = String(date.getDate()).padStart(2, '0');
+    const mm = String(date.getMonth() + 1).padStart(2, '0');
+    return `${dd}/${mm}/${date.getFullYear()}`;
 }
 
 function formatTime(date) {
@@ -55,8 +56,8 @@ export default {
                     }
                 }
                 if (found) {
-                    let text = `📋 *Detail: ${config.prefix}${found.name}*\n📝 ${found.description || 'Tidak ada deskripsi'}`;
-                    if (found.alias?.length) text += `\n🔁 Alias: ${found.alias.map(a => config.prefix + a).join(', ')}`;
+                    let text = `📋 *Detail: ${config.prefix}${found.name}*\n📚 ${found.description || 'Tidak ada deskripsi'}`;
+                    if (found.alias?.length) text += `\n🔗 Alias: ${found.alias.map(a => config.prefix + a).join(', ')}`;
                     return ctx.reply(text);
                 }
                 return ctx.reply(`❌ Perintah "${args[0]}" tidak ditemukan.`);
@@ -76,16 +77,22 @@ export default {
             // di .env — owner tetap owner saat chat private dengan orang lain / di grup.
             const isOwner = ctx.isOwner || ctx.isSelf;
 
-            // ─── NAMA TAMPILAN DARI KONTAK WA ──────────────────
+            // ─── NAMA TAMPILAN DARI KONTAK WA ───
             let displayName;
             if (ctx.isSelf) {
                 displayName = await resolveContactName(ctx.sock, ownerJid);
             } else {
                 displayName = await resolveContactName(ctx.sock, ctx.sender);
             }
-            // Fallback jika nama tidak valid
+            
+            // Fallback jika nama tidak valid (hanya angka/Unknown)
             if (!displayName || displayName === 'Unknown' || /^\d+$/.test(displayName)) {
-                displayName = isOwner ? 'Owner' : 'User';
+                // Coba gunakan ctx.pushName (berisi m.pushName dari WhatsApp) jika valid
+                if (ctx.pushName && ctx.pushName !== 'Unknown' && !/^\d+$/.test(ctx.pushName)) {
+                    displayName = ctx.pushName;
+                } else {
+                    displayName = isOwner ? 'Owner' : 'User';
+                }
             }
 
             let userRole = 'User';
@@ -112,14 +119,14 @@ export default {
             txt += `│ Prefix  : *[ ${prefix} ]*\n`;
             txt += `│ Uptime  : *${uptimeFormatted}*\n`;
             txt += `│ Total Cmd : *${uniqueCount}*\n`;
-            txt += `╰───────────\n\n`;
+            txt += `╰──────────\n\n`;
 
             txt += `╭───「 *INFO USER* 」\n`;
             txt += `│ Nama    : *${displayName}*\n`;
             txt += `│ Role    : *${roleEmoji} ${userRole}*\n`;
             txt += `│ Waktu   : *${timeStr} WIB*\n`;
             txt += `│ Tanggal : *${dateStr}*\n`;
-            txt += `╰───────────\n\n`;
+            txt += `╰──────────\n\n`;
 
             // Daftar perintah (tanpa kategori)
             const unique = new Map();
@@ -131,7 +138,7 @@ export default {
 
             txt += `╭───「 *DAFTAR PERINTAH* 」\n`;
             txt += `${cmdListLines}\n`;
-            txt += `╰───────────\n\n`;
+            txt += `╰──────────\n\n`;
 
             txt += `© *${config.botName}* | ${now.getFullYear()}\n`;
             txt += `Dev: Ahri De Valiente`;
@@ -141,8 +148,10 @@ export default {
             // Kirim sebagai gambar + caption jika ada gambar
             const imagePath = path.join(process.cwd(), 'assets', 'images', 'zeone.jpg');
             let imageBuffer = null;
+            
+            // FIX: Gunakan promises.readFile agar tidak memblokir event loop
             if (fs.existsSync(imagePath)) {
-                imageBuffer = fs.readFileSync(imagePath);
+                imageBuffer = await fs.promises.readFile(imagePath);
             }
 
             if (imageBuffer) {

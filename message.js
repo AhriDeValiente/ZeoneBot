@@ -1,21 +1,4 @@
 // message.js – Message Handler + Report Manager + Error Collector (hasil merge)
-// Gabungan dari 3 file lama:
-//   SECTION 1: Report Manager  — dari reports/reportManager.js  (laporan terenkripsi AES-256-GCM)
-//   SECTION 2: Error Collector — dari reports/errorCollector.js (global error handlers)
-//   SECTION 3: Message Handler — dari message.js asli (logging + command execution + dedup + antilink)
-// Hasil merge sebelumnya: logger & utils yang tadinya file terpisah (logger.js / utils.js)
-// sekarang diimpor dari zeone.js.
-//
-// Upgrade: DETEKSI OWNER — status owner melekat pada nomor terdaftar di .env
-// (OWNER_NUMBER), bukan jenis chat. Tersedia sebagai ctx.isOwner untuk semua
-// command (owner tetap owner di chat private dengan orang lain / di grup).
-// Semua error command tidak ditampilkan di chat — hanya dikirim ke nomor owner
-// (lihat handleCommandError di zeone.js).
-//
-// Catatan: file laporan tetap disimpan di reports/reports.json (folder reports/
-// kini hanya folder data, tanpa kode). Data lama tetap terbaca karena lokasi,
-// algoritma, dan kunci enkripsi tidak berubah.
-
 import {
     executeCommand,
     logger,
@@ -38,7 +21,7 @@ import crypto from "crypto";
 import { fileURLToPath } from "url";
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 1: REPORT MANAGER — laporan terenkripsi (dari reports/reportManager.js)
+// SECTION 1: REPORT MANAGER
 // ═════════════════════════════════════════════════════════════════════════════
 
 const __filename = fileURLToPath(import.meta.url);
@@ -51,16 +34,8 @@ const IV_LENGTH = 16;
 const SALT_LENGTH = 64;
 const AUTH_TAG_LENGTH = 16;
 
-let reports = {
-    errors: [],
-    commands: [],
-    metrics: [],
-    system: []
-};
-let writeQueue = Promise.resolve();
+let reports = { errors: [], commands: [], metrics: [], system: [] };
 
-// Diberi nama *Report agar tidak tertukar dengan encrypt/decrypt milik database.js
-// (kunci & format berbeda — ini khusus file reports.json).
 function deriveReportKey(password, salt) {
     return crypto.pbkdf2Sync(password, salt, 100000, 32, 'sha512');
 }
@@ -103,8 +78,14 @@ async function saveReports() {
     }
 }
 
+// ─── FIX: Debounce save untuk mencegah I/O bottleneck ───
+let saveTimeout = null;
 function scheduleSave() {
-    writeQueue = writeQueue.then(saveReports, saveReports);
+    if (saveTimeout) return;
+    saveTimeout = setTimeout(async () => {
+        saveTimeout = null;
+        await saveReports();
+    }, 3000); 
 }
 
 async function loadReports() {
@@ -121,38 +102,25 @@ async function loadReports() {
 await loadReports();
 
 export async function reportError(errorReport) {
-    reports.errors.push({
-        timestamp: new Date().toISOString(),
-        ...errorReport
-    });
+    reports.errors.push({ timestamp: new Date().toISOString(), ...errorReport });
     if (reports.errors.length > 1000) reports.errors = reports.errors.slice(-1000);
     scheduleSave();
 }
 
 export async function reportCommand(commandReport) {
-    reports.commands.push({
-        timestamp: new Date().toISOString(),
-        ...commandReport
-    });
+    reports.commands.push({ timestamp: new Date().toISOString(), ...commandReport });
     if (reports.commands.length > 5000) reports.commands = reports.commands.slice(-5000);
     scheduleSave();
 }
 
 export async function reportMetrics(metric) {
-    reports.metrics.push({
-        timestamp: new Date().toISOString(),
-        ...metric
-    });
+    reports.metrics.push({ timestamp: new Date().toISOString(), ...metric });
     if (reports.metrics.length > 1000) reports.metrics = reports.metrics.slice(-1000);
     scheduleSave();
 }
 
 export async function reportSystem(event, detail = '') {
-    reports.system.push({
-        timestamp: new Date().toISOString(),
-        event,
-        detail
-    });
+    reports.system.push({ timestamp: new Date().toISOString(), event, detail });
     if (reports.system.length > 500) reports.system = reports.system.slice(-500);
     scheduleSave();
 }
@@ -176,9 +144,7 @@ export function getSummary() {
     const recentCommands = reports.commands.filter(c => new Date(c.timestamp).getTime() > last24h);
     const recentErrors = reports.errors.filter(e => new Date(e.timestamp).getTime() > last24h);
     const commandFreq = {};
-    recentCommands.forEach(c => {
-        commandFreq[c.command] = (commandFreq[c.command] || 0) + 1;
-    });
+    recentCommands.forEach(c => { commandFreq[c.command] = (commandFreq[c.command] || 0) + 1; });
     const totalCommands = recentCommands.length || 1;
     const errorRate = ((recentErrors.length / totalCommands) * 100).toFixed(2);
     return {
@@ -187,10 +153,7 @@ export function getSummary() {
         last24hCommands: recentCommands.length,
         last24hErrors: recentErrors.length,
         errorRate: `${errorRate}%`,
-        topCommands: Object.entries(commandFreq)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 10)
-            .map(([cmd, count]) => ({ command: cmd, count }))
+        topCommands: Object.entries(commandFreq).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([cmd, count]) => ({ command: cmd, count }))
     };
 }
 
@@ -200,12 +163,9 @@ export async function clearReports() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 2: ERROR COLLECTOR — global error handlers (dari reports/errorCollector.js)
+// SECTION 2: ERROR COLLECTOR
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Pakai var (bukan let): start.js memanggil installGlobalErrorHandlers() di
-// top-level, dan karena message.js ↔ start.js saling import, flag ini harus
-// bisa diakses walau body message.js belum selesai dievaluasi (hindari TDZ).
 var errorHandlersInstalled = false;
 
 export function installGlobalErrorHandlers() {
@@ -214,45 +174,23 @@ export function installGlobalErrorHandlers() {
 
     process.on('uncaughtException', async (err) => {
         console.error('[FATAL] Uncaught Exception:', err);
-        await reportError({
-            type: 'uncaughtException',
-            message: err.message,
-            stack: err.stack,
-            timestamp: new Date().toISOString()
-        });
-        if (err.code === 'ECONNRESET' || err.code === 'EPIPE') {
-            process.exit(1);
-        }
+        await reportError({ type: 'uncaughtException', message: err.message, stack: err.stack, timestamp: new Date().toISOString() });
+        if (err.code === 'ECONNRESET' || err.code === 'EPIPE') process.exit(1);
     });
 
     process.on('unhandledRejection', async (reason) => {
         console.error('[UNHANDLED REJECTION]', reason);
-        await reportError({
-            type: 'unhandledRejection',
-            message: reason?.message || String(reason),
-            stack: reason?.stack || '',
-            timestamp: new Date().toISOString()
-        });
+        await reportError({ type: 'unhandledRejection', message: reason?.message || String(reason), stack: reason?.stack || '', timestamp: new Date().toISOString() });
     });
 
     process.on('warning', async (warning) => {
         if (warning.name === 'DeprecationWarning' && warning.message.includes('Baileys')) {
-            await reportError({
-                type: 'warning',
-                message: warning.message,
-                stack: warning.stack,
-                timestamp: new Date().toISOString()
-            });
+            await reportError({ type: 'warning', message: warning.message, stack: warning.stack, timestamp: new Date().toISOString() });
         }
     });
 
     process.on('multipleResolves', async (type, promise, reason) => {
-        await reportError({
-            type: 'multipleResolves',
-            message: `Type: ${type}, Reason: ${reason}`,
-            stack: '',
-            timestamp: new Date().toISOString()
-        });
+        await reportError({ type: 'multipleResolves', message: `Type: ${type}, Reason: ${reason}`, stack: '', timestamp: new Date().toISOString() });
     });
 
     process.on('exit', async (code) => {
@@ -263,50 +201,93 @@ export function installGlobalErrorHandlers() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// SECTION 3: MESSAGE HANDLER — logging + command execution (kode message.js asli)
+// SECTION 3: MESSAGE HANDLER
 // ═════════════════════════════════════════════════════════════════════════════
-
 
 const SHOW_MESSAGE_LOG = config.showMessageLog !== false;
 const LOG_OUTGOING_MESSAGES = config.logOutgoing !== false;
 const MESSAGE_CACHE_TTL = 30_000;
 const CACHE_TTL = 5 * 60 * 1000;
 
-// ─── PENDING COMMANDS — untuk graceful shutdown ───────────────────────────────
 export const pendingCommands = new Set();
 
 const processedMessages = new Map();
 function isMessageProcessed(messageId) {
     if (!messageId) return false;
     const now = Date.now();
-    for (const [id, ts] of processedMessages) {
-        if (now - ts > MESSAGE_CACHE_TTL) processedMessages.delete(id);
-    }
+    for (const [id, ts] of processedMessages) { if (now - ts > MESSAGE_CACHE_TTL) processedMessages.delete(id); }
     if (processedMessages.has(messageId)) return true;
     processedMessages.set(messageId, now);
     return false;
 }
 
-// Tandai ID pesan yang dikirim bot sendiri sebagai "sudah diproses" supaya echo
-// pesan keluar (jika masih masuk lewat messages.upsert, mis. emitOwnEvents aktif
-// atau kirim dari device lain) tidak ter-log dobel / dieksekusi ulang sebagai command.
 function markMessageProcessed(messageId) {
     if (messageId) processedMessages.set(messageId, Date.now());
+}
+
+const MESSAGE_STORE_TTL = 2 * 60 * 60 * 1000;
+const MESSAGE_STORE_MAX = 500;
+const messageStore = new Map();
+const messageStoreById = new Map();
+
+function deleteStoreEntry(storeKey, messageId) {
+    messageStore.delete(storeKey);
+    messageStoreById.delete(messageId);
+}
+
+export function storeMessage(msg) {
+    const key = msg?.key;
+    if (!key?.id || !key.remoteJid || !msg.message) return;
+    if (key.remoteJid === "status@broadcast") return;
+    const entry = { message: msg, ts: Date.now() };
+    messageStore.set(`${key.remoteJid}|${key.id}`, entry);
+    messageStoreById.set(key.id, entry);
+    if (messageStore.size > MESSAGE_STORE_MAX) {
+        const oldestKey = messageStore.keys().next().value;
+        deleteStoreEntry(oldestKey, messageStore.get(oldestKey).message.key.id);
+    }
+}
+
+export function loadStoredMessage(remoteJid, messageId) {
+    const entry = messageStore.get(`${remoteJid}|${messageId}`) || messageStoreById.get(messageId);
+    if (!entry) return undefined;
+    if (Date.now() - entry.ts > MESSAGE_STORE_TTL) {
+        deleteStoreEntry(`${entry.message.key.remoteJid}|${messageId}`, messageId);
+        return undefined;
+    }
+    return entry.message;
+}
+
+const SESSION_ERROR_RE = /bad mac|no session|sessionerror|session error|prekey|failed to decrypt|closing open session|identity key|invalid key/i;
+
+async function sendWithSessionRecovery(sock, targetJid, content, options) {
+    try {
+        return await sock.sendMessage(targetJid, content, options);
+    } catch (err) {
+        if (targetJid.endsWith("@g.us") || !SESSION_ERROR_RE.test(String(err?.message || ""))) throw err;
+        logger.warn(`[SESSION] Kirim ke ${targetJid} gagal (${err.message}) → hapus sesi korup & kirim ulang`);
+        try { await sock.signalRepository?.deleteSession?.([targetJid]); }
+        catch (e) { logger.warn(`[SESSION] Gagal hapus sesi ${targetJid}: ${e.message}`); }
+        return await sock.sendMessage(targetJid, content, options);
+    }
 }
 
 const groupSettingsCache = new Map();
 const groupMetadataCache = new Map();
 
-// Bersihkan cache yang kedaluwarsa setiap 10 menit
-setInterval(() => {
+// FIX: Tambahkan .unref() agar bot bisa exit natural
+const cleanupInterval = setInterval(() => {
     const now = Date.now();
-    for (const [key, entry] of groupSettingsCache) {
-        if (now > entry.expires) groupSettingsCache.delete(key);
-    }
-    for (const [key, entry] of groupMetadataCache) {
-        if (now > entry.expires) groupMetadataCache.delete(key);
+    for (const [key, entry] of groupSettingsCache) { if (now > entry.expires) groupSettingsCache.delete(key); }
+    for (const [key, entry] of groupMetadataCache) { if (now > entry.expires) groupMetadataCache.delete(key); }
+    for (const [key, entry] of messageStore) {
+        if (now - entry.ts > MESSAGE_STORE_TTL) {
+            messageStore.delete(key);
+            messageStoreById.delete(entry.message.key.id);
+        }
     }
 }, 10 * 60 * 1000);
+cleanupInterval.unref();
 
 async function getGroupSettingsCached(groupId) {
     const cached = groupSettingsCache.get(groupId);
@@ -324,15 +305,10 @@ async function getGroupMetadataCached(sock, groupId) {
     return metadata;
 }
 
-// ─── RESOLVE NAMA KONTAK WA ASLI (HANYA UNTUK LOGGING) ─
 const senderNameCache = new Map();
 
 function _isValidName(name) {
-    return name && typeof name === 'string'
-        && !/^\d+$/.test(name)
-        && name !== '-'
-        && name !== 'Unknown'
-        && !name.includes(':');
+    return name && typeof name === 'string' && !/^\d+$/.test(name) && name !== '-' && name !== 'Unknown' && !name.includes(':');
 }
 
 function _baseNum(jid) {
@@ -346,8 +322,7 @@ function resolvePhoneJid(sock, jid) {
     if (jid.endsWith('@lid') && sock?.contacts) {
         const lidBase = _baseNum(jid);
         for (const [contactJid, contact] of Object.entries(sock.contacts)) {
-            if (!contactJid.endsWith('@s.whatsapp.net')) continue;
-            if (!contact?.lid) continue;
+            if (!contactJid.endsWith('@s.whatsapp.net') || !contact?.lid) continue;
             if (_baseNum(contact.lid) === lidBase) return `${_baseNum(contactJid)}@s.whatsapp.net`;
         }
     }
@@ -373,41 +348,25 @@ export async function resolveContactName(sock, jid) {
         }
     }
 
-    const jidVariants = [
-        jid,
-        `${base}@s.whatsapp.net`,
-        `${cleaned}@s.whatsapp.net`,
-        `${base}@lid`,
-        `${cleaned}@lid`,
-    ];
+    const jidVariants = [jid, `${base}@s.whatsapp.net`, `${cleaned}@s.whatsapp.net`, `${base}@lid`, `${cleaned}@lid`];
 
-    let attempts = 0;
-    const maxAttempts = 5;
-    const retryDelay = 3000;
-
-    while (attempts < maxAttempts) {
-        if (sock.contacts && Object.keys(sock.contacts).length > 0) {
-            for (const variant of jidVariants) {
-                const c = sock.contacts[variant];
-                if (!c) continue;
-                const name = c.notify || c.name || c.vname;
-                if (_isValidName(name)) {
-                    senderNameCache.set(cacheKey, { name, expires: Date.now() + CACHE_TTL });
-                    return name;
-                }
+    // FIX: Hapus while loop setTimeout 15 detik yang memblokir
+    if (sock.contacts && Object.keys(sock.contacts).length > 0) {
+        for (const variant of jidVariants) {
+            const c = sock.contacts[variant];
+            if (!c) continue;
+            const name = c.notify || c.name || c.vname;
+            if (_isValidName(name)) {
+                senderNameCache.set(cacheKey, { name, expires: Date.now() + CACHE_TTL });
+                return name;
             }
-            break;
-        }
-        attempts++;
-        if (attempts < maxAttempts) {
-            await new Promise(resolve => setTimeout(resolve, retryDelay));
         }
     }
 
     try {
         const name = await Promise.race([
             sock.getName(jid),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000))
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
         ]);
         if (_isValidName(name)) {
             senderNameCache.set(cacheKey, { name, expires: Date.now() + CACHE_TTL });
@@ -423,9 +382,7 @@ export async function resolveContactName(sock, jid) {
 function formatExtraDetails(m) {
     const msg = m.message;
     if (!msg) return "";
-
     const details = [];
-
     if (msg.imageMessage) {
         details.push(`🖼️ Image${msg.imageMessage.caption ? " (caption)" : ""} | mimetype: ${msg.imageMessage.mimetype}`);
         if (msg.imageMessage.fileLength) details.push(`   Size: ${formatFileSize(msg.imageMessage.fileLength)}`);
@@ -447,13 +404,11 @@ function formatExtraDetails(m) {
     if (msg.stickerMessage) details.push(`🖼️ Sticker | mimetype: ${msg.stickerMessage.mimetype}`);
     if (msg.locationMessage) details.push(`📍 Location`);
     if (msg.contactMessage) details.push(`👤 Contact`);
-
     const ctxInfo = msg.extendedTextMessage?.contextInfo;
     if (ctxInfo?.quotedMessage) {
         const quotedType = Object.keys(ctxInfo.quotedMessage)[0];
         details.push(`↩️ Quoted: ${quotedType}`);
     }
-
     return details.join("\n");
 }
 
@@ -506,18 +461,10 @@ export function logOutgoingMessage(jid, content, displayName = null) {
     const ts = new Date().toLocaleTimeString();
     const contentType = typeof content === "object" ? Object.keys(content)[0] : "text";
     const text = typeof content.text === "string" ? content.text : `[${contentType}]`;
-    const nameLabel = displayName && !/^\d+$/.test(displayName) && displayName !== 'Unknown'
-        ? displayName
-        : cleanJid(jid);
+    const nameLabel = displayName && !/^\d+$/.test(displayName) && displayName !== 'Unknown' ? displayName : cleanJid(jid);
     logMessage({
-        jid,
-        pushName: `[BOT→] ${nameLabel}`,
-        chatType: formatChatType(jid),
-        msgType: contentType,
-        text,
-        extra: "",
-        ts,
-        isOutgoing: true
+        jid, pushName: `[BOT→] ${nameLabel}`, chatType: formatChatType(jid),
+        msgType: contentType, text, extra: "", ts, isOutgoing: true
     });
 }
 
@@ -532,7 +479,6 @@ async function handleAntilink(sock, m, remoteJid, commandText, ctx) {
         const metadata = await getGroupMetadataCached(sock, remoteJid);
         const isSenderAdmin = metadata?.participants?.some(p => p.id === sender && (p.admin === "admin" || p.admin === "superadmin"));
         if (isSenderAdmin) return;
-
         const action = settings.antilink.action || "delete";
         if (action === "delete") {
             await sock.sendMessage(remoteJid, { delete: m.key });
@@ -544,14 +490,7 @@ async function handleAntilink(sock, m, remoteJid, commandText, ctx) {
     }
 }
 
-// ─── DETEKSI OWNER — status pengirim: owner vs user ──────────────────────────
-// Owner = nomor yang terdaftar di .env (OWNER_NUMBER). Status melekat pada NOMOR
-// pengirim, bukan jenis chat: owner tetap ber-status owner saat mengirim command
-// di chat private dengan orang lain maupun di grup. Perbandingan memakai nomor
-// dasar (tanpa @domain / :device) supaya "628xxx:5", "@lid", dsb. tetap cocok.
-const OWNER_JID = config.ownerNumber
-    ? (config.ownerNumber.includes('@') ? config.ownerNumber : `${config.ownerNumber}@s.whatsapp.net`)
-    : '';
+const OWNER_JID = config.ownerNumber ? (config.ownerNumber.includes('@') ? config.ownerNumber : `${config.ownerNumber}@s.whatsapp.net`) : '';
 
 function isOwnerJid(jid) {
     if (!OWNER_JID || !jid) return false;
@@ -577,24 +516,17 @@ export async function handleIncomingMessages(sock, msg, state) {
 
         if (!state.isReady && !selfChat) continue;
 
-        // ── DETEKSI OWNER ──
-        // Mode self-bot (bot berjalan di akun owner): semua pesan fromMe berarti
-        // dikirim oleh owner sendiri, termasuk saat owner chat private dengan
-        // orang lain atau kirim pesan di grup.
         const botIsOwnerAccount = isOwnerJid(state.botNumber) || isOwnerJid(state.botLid);
         const rawSenderJid = m.key.participant || remoteJid;
-        const isOwner = selfChat
-            || (fromMe && botIsOwnerAccount)
-            || isOwnerJid(rawSenderJid)
-            || isOwnerJid(resolvePhoneJid(sock, rawSenderJid));
-        const senderJid = (selfChat || (fromMe && botIsOwnerAccount)) && OWNER_JID
-            ? OWNER_JID
-            : rawSenderJid;
+        const isOwner = selfChat || (fromMe && botIsOwnerAccount) || isOwnerJid(rawSenderJid) || isOwnerJid(resolvePhoneJid(sock, rawSenderJid));
+        const senderJid = (selfChat || (fromMe && botIsOwnerAccount)) && OWNER_JID ? OWNER_JID : rawSenderJid;
 
         const resolvedName = await resolveContactName(sock, senderJid);
+        const validResolved = _isValidName(resolvedName) ? resolvedName : null;
+        const validPushName = _isValidName(m.pushName) ? m.pushName : null;
+        const finalDisplayName = validResolved || validPushName || resolvedName || cleanJid(remoteJid);
 
-        const rawTargetJid = selfChat ? `${state.botNumber}@s.whatsapp.net` : remoteJid;
-        const targetJid = chatType === "GROUP" ? rawTargetJid : resolvePhoneJid(sock, rawTargetJid);
+        const targetJid = remoteJid;
         const participant = m.key.participant || remoteJid;
         const groupMetadata = chatType === "GROUP" ? await getGroupMetadataCached(sock, remoteJid) : null;
         const isAdmin = chatType === "GROUP"
@@ -602,32 +534,19 @@ export async function handleIncomingMessages(sock, msg, state) {
             : false;
 
         const ctx = {
-            sock,
-            id: targetJid,
-            sender: senderJid,
-            chatType: selfChat ? "SELF" : chatType,
-            isGroup: chatType === "GROUP",
-            isPrivate: chatType === "PRIVATE" && !selfChat,
-            isSelf: selfChat,
-            isOwner,
-            isAdmin,
-            fromMe,
-            pushName: resolvedName || m.pushName || cleanJid(remoteJid),
+            sock, id: targetJid, sender: senderJid, chatType: selfChat ? "SELF" : chatType,
+            isGroup: chatType === "GROUP", isPrivate: chatType === "PRIVATE" && !selfChat,
+            isSelf: selfChat, isOwner, isAdmin, fromMe, pushName: finalDisplayName,
             quoted: m.message?.extendedTextMessage?.contextInfo?.quotedMessage ? m : null,
             mentionedJid: m.message?.extendedTextMessage?.contextInfo?.mentionedJid || [],
-            groupMetadata,
-            botLid: state.botLid,
-            msg: m,
+            groupMetadata, botLid: state.botLid, msg: m,
             reply: async (replyText, options = {}) => {
                 if (!state.isConnected) { logger.warn(`[REPLY SKIP] Bot tidak connected → ${targetJid}`); return null; }
                 if (!sock.user) { logger.warn(`[REPLY SKIP] sock.user null → ${targetJid}`); return null; }
                 try {
-                    const result = await sock.sendMessage(
-                        targetJid,
-                        { text: String(sanitizeText(replyText)) },
-                        { quoted: fromMe ? undefined : m, ...options }
-                    );
+                    const result = await sendWithSessionRecovery(sock, targetJid, { text: String(replyText) }, { quoted: fromMe ? undefined : m, ...options });
                     markMessageProcessed(result?.key?.id);
+                    storeMessage(result);
                     logOutgoingMessage(targetJid, { text: String(replyText) }, resolvedName || m.pushName);
                     return result;
                 } catch (err) {
@@ -639,8 +558,9 @@ export async function handleIncomingMessages(sock, msg, state) {
                 if (!state.isConnected) { logger.warn(`[SENDTEXT SKIP] Bot tidak connected → ${targetJid}`); return null; }
                 if (!sock.user) { logger.warn(`[SENDTEXT SKIP] sock.user null → ${targetJid}`); return null; }
                 try {
-                    const result = await sock.sendMessage(targetJid, { text: String(sanitizeText(textContent)) });
+                    const result = await sendWithSessionRecovery(sock, targetJid, { text: String(sanitizeText(textContent)) });
                     markMessageProcessed(result?.key?.id);
+                    storeMessage(result);
                     logOutgoingMessage(targetJid, { text: String(textContent) }, resolvedName || m.pushName);
                     return result;
                 } catch (err) {
@@ -652,9 +572,11 @@ export async function handleIncomingMessages(sock, msg, state) {
                 if (!state.isConnected) { logger.warn(`[SENDMSG SKIP] Bot tidak connected → ${targetJid}`); return null; }
                 if (!sock.user) { logger.warn(`[SENDMSG SKIP] sock.user null → ${targetJid}`); return null; }
                 try {
-                    const result = await sock.sendMessage(targetJid, content, { quoted: m, ...options });
+                    const result = await sendWithSessionRecovery(sock, targetJid, content, { quoted: m, ...options });
                     markMessageProcessed(result?.key?.id);
-                    if (content.text) logOutgoingMessage(targetJid, { text: content.text }, resolvedName || m.pushName);
+                    storeMessage(result);
+                    // FIX: Gunakan typeof string agar pesan kosong tetap ter-log
+                    if (typeof content.text === 'string') logOutgoingMessage(targetJid, { text: content.text }, resolvedName || m.pushName);
                     else if (content.image) logOutgoingMessage(targetJid, { image: true, caption: content.caption, mimetype: content.mimetype, fileLength: content.fileLength }, resolvedName || m.pushName);
                     else if (content.video) logOutgoingMessage(targetJid, { video: true, caption: content.caption, mimetype: content.mimetype, fileLength: content.fileLength }, resolvedName || m.pushName);
                     else if (content.document) logOutgoingMessage(targetJid, { document: true, fileName: content.fileName, mimetype: content.mimetype, fileLength: content.fileLength }, resolvedName || m.pushName);
@@ -672,34 +594,26 @@ export async function handleIncomingMessages(sock, msg, state) {
                 const owner = config.ownerNumber;
                 if (!owner) return;
                 const ownerJid = owner.includes("@") ? owner : `${owner}@s.whatsapp.net`;
-                try { await sock.sendMessage(ownerJid, { text: String(message) }); }
-                catch (err) { logger.warn(`notifyOwner gagal: ${err.message}`); }
+                try {
+                    const result = await sendWithSessionRecovery(sock, ownerJid, { text: String(message) });
+                    storeMessage(result);
+                } catch (err) { logger.warn(`notifyOwner gagal: ${err.message}`); }
             }
         };
 
         if (isCommand) {
             executeCommand(sock, m, ctx).catch(err => {
-                if (!/bad mac|prekey/i.test(err?.message || ""))
-                    logger.error(chalk.red("[Command Error]"), err?.message || err);
+                if (!/bad mac|prekey/i.test(err?.message || "")) logger.error(chalk.red("[Command Error]"), err?.message || err);
             });
 
             if (SHOW_MESSAGE_LOG) {
                 const ts = new Date().toLocaleTimeString();
-                const bestName = (_isValidName(resolvedName) ? resolvedName : null)
-                    || (_isValidName(m.pushName) ? m.pushName : null)
-                    || resolvedName;
                 const senderPhoneJid = `${_baseNum(senderJid)}@s.whatsapp.net`;
                 const displayChatType = fromMe ? (selfChat ? "SELF" : "PRIVATE") : chatType;
                 logMessage({
-                    jid: senderPhoneJid,
-                    pushName: bestName || config.botName,
-                    chatType: displayChatType,
-                    chatJid: displayChatType === "GROUP" ? remoteJid : null,
-                    msgType: getMessageType(m),
-                    text: commandText,
-                    extra: "",
-                    ts,
-                    isOutgoing: fromMe
+                    jid: senderPhoneJid, pushName: finalDisplayName || config.botName,
+                    chatType: displayChatType, chatJid: displayChatType === "GROUP" ? remoteJid : null,
+                    msgType: getMessageType(m), text: commandText, extra: "", ts, isOutgoing: fromMe
                 });
             }
             continue;
@@ -709,21 +623,12 @@ export async function handleIncomingMessages(sock, msg, state) {
 
         if (SHOW_MESSAGE_LOG) {
             const ts = new Date().toLocaleTimeString();
-            const bestName = (_isValidName(resolvedName) ? resolvedName : null)
-                || (_isValidName(m.pushName) ? m.pushName : null)
-                || resolvedName;
             const senderPhoneJid = `${_baseNum(senderJid)}@s.whatsapp.net`;
             const displayChatType = fromMe ? (selfChat ? "SELF" : "PRIVATE") : chatType;
             logMessage({
-                jid: senderPhoneJid,
-                pushName: bestName || config.botName,
-                chatType: displayChatType,
-                chatJid: displayChatType === "GROUP" ? remoteJid : null,
-                msgType: getMessageType(m),
-                text: extractMessageText(m),
-                extra: formatExtraDetails(m),
-                ts,
-                isOutgoing: fromMe
+                jid: senderPhoneJid, pushName: finalDisplayName || config.botName,
+                chatType: displayChatType, chatJid: displayChatType === "GROUP" ? remoteJid : null,
+                msgType: getMessageType(m), text: extractMessageText(m), extra: formatExtraDetails(m), ts, isOutgoing: fromMe
             });
         }
 
@@ -736,5 +641,4 @@ export async function handleIncomingMessages(sock, msg, state) {
 export function invalidateGroupSettingsCache(groupId) { groupSettingsCache.delete(groupId); }
 export function invalidateGroupMetadataCache(groupId) { groupMetadataCache.delete(groupId); }
 
-// Ekspor untuk unit test (wajib)
 export { handleAntilink, resolvePhoneJid };
